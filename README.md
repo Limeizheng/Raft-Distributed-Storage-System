@@ -1,28 +1,46 @@
-# raft-java
-Raft implementation library for Java.<br>
-参考自[Raft论文](https://github.com/maemual/raft-zh_cn)和Raft作者的开源实现[LogCabin](https://github.com/logcabin/logcabin)。
+# Raft-Distributed-Storage-System
 
-# 支持的功能
-* leader选举
-* 日志复制
-* snapshot
-* 集群成员动态更变
+## System Architecture Overview
+This system is built on a Multi-Raft architecture derived from the Raft consensus algorithm. In this design, data is partitioned into multiple shards, with each shard managed by an independent Raft Group. This approach enables data to be migrated among different Raft Groups for dynamic load balancing and fault recovery.
+
+## Key Features
+- **Multi-Raft data sharding**: The system partitions data into multiple shards, each maintained by its own Raft Group, which improves scalability and load balancing.
+- **Data migration**: Supports migrating data across different Raft Groups for load balancing and fault recovery.
+- **Linearizable KV read and write**: Provides a strongly consistent read and write API, offering linearizable semantics.
+- **Performance optimization**: Enhances Raft performance using asynchronous Apply, ReadIndex, FollowerRead, PreVote, and other techniques to improve overall throughput and latency.
+- **Pluggable storage engines**: Supports various storage engines (e.g., RocksDB, B+ tree, hash table) to meet diverse storage and performance requirements.
 
 ## Quick Start
-在本地单机上部署一套3实例的raft集群，执行如下脚本：<br>
-cd raft-java-example && sh deploy.sh <br>
-该脚本会在raft-java-example/env目录部署三个实例example1、example2、example3；<br>
-同时会创建一个client目录，用于测试raft集群读写功能。<br>
-部署成功后，测试写操作，通过如下脚本：
-cd env/client <br>
-./bin/run_client.sh "list://127.0.0.1:8051,127.0.0.1:8052,127.0.0.1:8053" hello world <br>
-测试读操作命令：<br>
-./bin/run_client.sh "list://127.0.0.1:8051,127.0.0.1:8052,127.0.0.1:8053" hello
 
-# 使用方法
-下面介绍如何在代码中使用raft-java依赖库来实现一套分布式存储系统。
-## 配置依赖（暂未发布到maven中央仓库，需要手动install到本地）
+### 1. Deploying a 3-Instance Raft Cluster Locally
+From the project root, run the following script to deploy a 3-node Raft cluster on a single machine:
+```bash
+cd raft-java-example && sh deploy.sh
 ```
+This script will create three instances (`example1`, `example2`, `example3`) under the `raft-java-example/env` directory. It will also create a `client` directory for testing the read and write functionality of the Raft cluster.
+
+### 2. Testing Write Operations
+Once the cluster is successfully deployed, you can test write operations with:
+```bash
+cd env/client
+./bin/run_client.sh "list://127.0.0.1:8051,127.0.0.1:8052,127.0.0.1:8053" hello world
+```
+Here, `"list://127.0.0.1:8051,127.0.0.1:8052,127.0.0.1:8053"` specifies the addresses of the three Raft nodes.
+
+### 3. Testing Read Operations
+To read the data you just wrote:
+```bash
+./bin/run_client.sh "list://127.0.0.1:8051,127.0.0.1:8052,127.0.0.1:8053" hello
+```
+This command retrieves the value associated with the key `hello`.
+
+---
+
+# How to Use the `raft-java` Library in Your Own Code
+
+## 1. Add the Maven Dependency
+Include the following in your `pom.xml`:
+```xml
 <dependency>
     <groupId>com.github.raftimpl.raft</groupId>
     <artifactId>raft-java-core</artifactId>
@@ -30,22 +48,29 @@ cd env/client <br>
 </dependency>
 ```
 
-## 定义数据写入和读取接口
+## 2. Define Your Data Read/Write Interfaces
+
+### Protobuf Definitions
 ```protobuf
 message SetRequest {
     string key = 1;
     string value = 2;
 }
+
 message SetResponse {
     bool success = 1;
 }
+
 message GetRequest {
     string key = 1;
 }
+
 message GetResponse {
     string value = 1;
 }
 ```
+
+### Java Interface
 ```java
 public interface ExampleService {
     Example.SetResponse set(Example.SetRequest request);
@@ -53,69 +78,97 @@ public interface ExampleService {
 }
 ```
 
-## 服务端使用方法
-1. 实现状态机StateMachine接口实现类
+## 3. Implement the Server
+
+### 3.1 Implement the `StateMachine` Interface
+Your service needs a state machine that Raft will use to apply the replicated logs. It must implement the following methods:
 ```java
-// 该接口三个方法主要是给Raft内部调用
 public interface StateMachine {
     /**
-     * 对状态机中数据进行snapshot，每个节点本地定时调用
-     * @param snapshotDir snapshot数据输出目录
+     * Take a snapshot of the current state machine data. 
+     * This is invoked periodically on each node.
+     * @param snapshotDir the directory where snapshot data should be written
      */
     void writeSnapshot(String snapshotDir);
+
     /**
-     * 读取snapshot到状态机，节点启动时调用
-     * @param snapshotDir snapshot数据目录
+     * Load the state machine from a given snapshot directory.
+     * This is invoked when the node starts or needs to recover from a snapshot.
+     * @param snapshotDir the directory containing the snapshot data
      */
     void readSnapshot(String snapshotDir);
+
     /**
-     * 将数据应用到状态机
-     * @param dataBytes 数据二进制
+     * Apply the given data to the state machine. 
+     * This is typically the log entry data from the Raft replication layer.
+     * @param dataBytes the data to be applied
      */
     void apply(byte[] dataBytes);
 }
 ```
 
-2. 实现数据写入和读取接口
-```
-// ExampleService实现类中需要包含以下成员
+### 3.2 Implement Data Write and Read Logic
+Your Raft-based service class will likely hold:
+```java
 private RaftNode raftNode;
 private ExampleStateMachine stateMachine;
 ```
-```
-// 数据写入主要逻辑
+
+#### Data Write
+```java
+// Convert the request to bytes
 byte[] data = request.toByteArray();
-// 数据同步写入raft集群
+
+// Replicate the data to the Raft cluster
 boolean success = raftNode.replicate(data, Raft.EntryType.ENTRY_TYPE_DATA);
-Example.SetResponse response = Example.SetResponse.newBuilder().setSuccess(success).build();
-```
-```
-// 数据读取主要逻辑，由具体应用状态机实现
-Example.GetResponse response = stateMachine.get(request);
+
+// Build and return the response
+Example.SetResponse response = Example.SetResponse.newBuilder()
+    .setSuccess(success)
+    .build();
+return response;
 ```
 
-3. 服务端启动逻辑
+#### Data Read
+```java
+// The read is served by your application-level state machine
+Example.GetResponse response = stateMachine.get(request);
+return response;
 ```
-// 初始化RPCServer
+
+### 3.3 Server Startup
+Below is a simplified example showing how to set up and start your server with Raft:
+
+```java
+// 1. Initialize RPCServer
 RPCServer server = new RPCServer(localServer.getEndPoint().getPort());
-// 应用状态机
+
+// 2. Create and set your application state machine
 ExampleStateMachine stateMachine = new ExampleStateMachine();
-// 设置Raft选项，比如：
-RaftOptions.snapshotMinLogSize = 10 * 1024;
-RaftOptions.snapshotPeriodSeconds = 30;
-RaftOptions.maxSegmentFileSize = 1024 * 1024;
-// 初始化RaftNode
+
+// 3. Configure Raft options (examples shown)
+RaftOptions.snapshotMinLogSize = 10 * 1024;       // Min log size to trigger a snapshot
+RaftOptions.snapshotPeriodSeconds = 30;          // Snapshot interval
+RaftOptions.maxSegmentFileSize = 1024 * 1024;    // Max segment file size for logs
+
+// 4. Initialize the RaftNode
 RaftNode raftNode = new RaftNode(serverList, localServer, stateMachine);
-// 注册Raft节点之间相互调用的服务
+
+// 5. Register the Raft services for inter-node consensus
 RaftConsensusService raftConsensusService = new RaftConsensusServiceImpl(raftNode);
 server.registerService(raftConsensusService);
-// 注册给Client调用的Raft服务
+
+// 6. Register the Raft client service
 RaftClientService raftClientService = new RaftClientServiceImpl(raftNode);
 server.registerService(raftClientService);
-// 注册应用自己提供的服务
+
+// 7. Register your application’s own service
 ExampleService exampleService = new ExampleServiceImpl(raftNode, stateMachine);
 server.registerService(exampleService);
-// 启动RPCServer，初始化Raft节点
+
+// 8. Start the RPC server and initialize the Raft node
 server.start();
 raftNode.init();
 ```
+
+By following these steps, you can stand up your own Raft-based distributed storage system, leveraging the `raft-java` library for replication and consensus. The `StateMachine` implementation and the logic for reading/writing data can then be tailored to suit your specific use case.
